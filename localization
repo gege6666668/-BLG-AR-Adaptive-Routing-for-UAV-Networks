@@ -1,0 +1,271 @@
+clc; clearvars; close all;
+
+%% ========== 参数设置 ==========
+% 网络参数
+numBlindNodes = 152;
+numAnchorNodes = 38;
+communicationRange = 120;
+xBounds = [0, 500]; yBounds = [0, 500]; zBounds = [100, 400];
+
+% 定位算法参数（论文公式7-10）
+RSSI0 = -40; n = 3;          % RSSI模型参数
+noise_sigma = 1;             % 高斯白噪声标准差
+minAnchorThreshold = 3;      % 最小锚节点数量
+maxAcceptableError = 3.5;    % 最大可接受定位误差τ
+beta = 0.5; gamma = 0.5;     % 置信度衰减参数（公式9）
+eta = 0.1;                   % 动态误差修正学习率（公式5）
+
+% 仿真参数
+deltaT = 0.5;                % 时间步长
+simTime = 200;               % 总仿真时间
+
+% 5组源-目的节点对
+srcNodes = [1, 20, 35, 50, 75];
+dstNodes = [101, 105, 110, 115, 120];
+numPairs = length(srcNodes);
+
+%% ========== 初始化节点 ==========
+% 初始化锚节点
+anchorIDs = num2cell((numBlindNodes+1):(numBlindNodes+numAnchorNodes))';
+anchorPositions = [ ...
+    rand(numAnchorNodes,1)*diff(xBounds)+xBounds(1), ...
+    rand(numAnchorNodes,1)*diff(yBounds)+yBounds(1), ...
+    rand(numAnchorNodes,1)*diff(zBounds)+zBounds(1)];
+
+% 速度初始化
+anchorDirections = randn(numAnchorNodes,3);
+anchorDirections = anchorDirections ./ vecnorm(anchorDirections,2,2);
+anchorSpeeds = 70 + 30*rand(numAnchorNodes,1);
+anchorVelocities = anchorDirections .* anchorSpeeds;
+
+anchorNodes = struct(...
+    'id', anchorIDs, ...
+    'position', num2cell(anchorPositions,2), ...
+    'velocity', num2cell(anchorVelocities,2), ...
+    'confidence', num2cell(ones(numAnchorNodes,1)), ...
+    'delta', num2cell(zeros(numAnchorNodes,1)));  % 动态误差修正因子Δ
+
+% 初始化盲节点
+blindIDs = num2cell(1:numBlindNodes)';
+blindPositions = [ ...
+    rand(numBlindNodes,1)*diff(xBounds)+xBounds(1), ...
+    rand(numBlindNodes,1)*diff(yBounds)+yBounds(1), ...
+    rand(numBlindNodes,1)*diff(zBounds)+zBounds(1)];
+
+blindDirections = randn(numBlindNodes,3);
+blindDirections = blindDirections ./ vecnorm(blindDirections,2,2);
+blindSpeeds = 70 + 30*rand(numBlindNodes,1);
+blindVelocities = blindDirections .* blindSpeeds;
+
+blindNodes = struct(...
+    'id', blindIDs, ...
+    'position', num2cell(blindPositions,2), ...
+    'velocity', num2cell(blindVelocities,2));
+
+%% ========== 初始化定位变量 ==========
+located = false(numBlindNodes,1);
+estimatedPositions = nan(numBlindNodes,3);
+errors = nan(numBlindNodes,1);
+auxiliaryAnchors = anchorNodes;  % 辅助锚点池（包含原始锚点+已定位盲节点）
+
+% 记录定位性能
+roundLocatedCount = zeros(simTime/deltaT, 1);
+roundAvgError = zeros(simTime/deltaT, 1);
+
+%% ========== 主仿真循环 ==========
+for currentTime = 0:deltaT:simTime
+    round = currentTime/deltaT + 1;
+    
+    % ===== 1. 更新节点位置 =====
+    [auxiliaryAnchors, blindNodes] = updatePositions(auxiliaryAnchors, blindNodes, ...
+        located, xBounds, yBounds, zBounds, deltaT);
+    
+    % ===== 2. 盲节点定位（论文公式1-10） =====
+    newlyLocated = 0;
+    currentRoundErrors = [];
+    
+    for i = 1:numBlindNodes
+        if located(i); continue; end
+        
+        blindPos = blindNodes(i).position;
+        
+        % 获取通信范围内的所有锚节点（包括辅助锚点）
+        anchorPosAll = vertcat(auxiliaryAnchors.position);
+        dists = vecnorm(anchorPosAll - blindPos, 2, 2);
+        validMask = dists <= communicationRange;
+        
+        if sum(validMask) < minAnchorThreshold
+            continue;  % 锚点数量不足，跳过定位
+        end
+        
+        % 获取有效锚节点
+        validAnchors = auxiliaryAnchors(validMask);
+        validDists = dists(validMask);
+        
+        % === 2.1 RSSI测距（公式1） ===
+        % 修正：添加高斯白噪声
+        RSSI_measured = RSSI0 - 10*n*log10(validDists) + noise_sigma*randn(size(validDists));
+        d_estimated = 10.^((RSSI0 - RSSI_measured) / (10*n));  % 初始估计距离
+        
+        % === 2.2 动态误差修正（公式4-6） ===
+        deltas = [validAnchors.delta]';
+        d_corrected = d_estimated + deltas;  % 公式4：修正后的估计距离
+        
+        % === 2.3 构建定位方程组（公式2-3） ===
+        p = vertcat(validAnchors.position);
+        k = size(p, 1);
+        
+        % 以第一个锚点为参考，构建差分方程组
+        A = zeros(k-1, 3);
+        b = zeros(k-1, 1);
+        
+        for j = 2:k
+            A(j-1, :) = 2 * (p(1, :) - p(j, :));
+            b(j-1) = d_corrected(j)^2 - d_corrected(1)^2 + ...
+                      (p(1,1)^2 + p(1,2)^2 + p(1,3)^2) - ...
+                      (p(j,1)^2 + p(j,2)^2 + p(j,3)^2);
+        end
+        
+        % === 2.4 加权最小二乘求解（公式8-10） ===
+        % 获取置信度权重（公式8）
+        confidences = [validAnchors.confidence]';
+        W = diag(confidences(2:end));  % 权重矩阵（排除参考锚点）
+        
+        % 加权最小二乘解（公式10）
+        try
+            estimatedPos = (A' * W * A) \ (A' * W * b);
+        catch
+            % 若矩阵奇异，使用普通最小二乘
+            estimatedPos = (A' * A) \ (A' * b);
+        end
+        
+        % 计算定位误差
+        locError = norm(estimatedPos - blindPos);
+        
+        % === 2.5 判断是否满足升级条件（公式7） ===
+        if locError <= maxAcceptableError
+            located(i) = true;
+            estimatedPositions(i, :) = estimatedPos;
+            errors(i) = locError;
+            newlyLocated = newlyLocated + 1;
+            currentRoundErrors = [currentRoundErrors; locError];
+            
+            % 计算该盲节点的置信度（公式8）
+            % 参数α由公式9确定：α = -ln(β) / (γ * τ)
+            alpha = -log(beta) / (gamma * maxAcceptableError);
+            nodeConfidence = exp(-alpha * locError);
+            
+            % === 2.6 动态更新锚节点的误差修正因子（公式5-6） ===
+            % 为使用过的锚节点更新delta值
+            for j = 1:length(validAnchors)
+                anchorIdx = find([auxiliaryAnchors.id] == validAnchors(j).id, 1);
+                if ~isempty(anchorIdx)
+                    trueDist = validDists(j);
+                    oldDelta = auxiliaryAnchors(anchorIdx).delta;
+                    % 公式6：Error = |trueDist - d_estimated|
+                    rangingError = abs(trueDist - d_estimated(j));
+                    % 公式5：Δ_new = (1-η)*Δ_old + η*Error
+                    auxiliaryAnchors(anchorIdx).delta = (1-eta) * oldDelta + eta * rangingError;
+                end
+            end
+            
+            % === 2.7 将满足条件的盲节点升级为辅助锚点 ===
+            % 生成随机速度
+            newDirection = randn(1,3);
+            newDirection = newDirection / norm(newDirection);
+            newSpeed = 70 + 30*rand();
+            newVelocity = newDirection * newSpeed;
+            
+            auxiliaryAnchors(end+1) = struct(...
+                'id', blindNodes(i).id, ...
+                'position', estimatedPos, ...
+                'velocity', newVelocity, ...
+                'confidence', nodeConfidence, ...
+                'delta', 0);
+        end
+    end
+    
+    % 记录本轮定位性能
+    roundLocatedCount(round) = sum(located);
+    if ~isempty(currentRoundErrors)
+        roundAvgError(round) = mean(currentRoundErrors);
+    end
+    
+    % 每10轮输出一次进度
+    if mod(round, 20) == 0
+        fprintf('时间: %.1fs | 已定位: %d/%d (%.1f%%) | 平均误差: %.2fm\n', ...
+            currentTime, sum(located), numBlindNodes, ...
+            100*sum(located)/numBlindNodes, roundAvgError(round));
+    end
+end
+
+%% ========== 最终定位性能评估 ==========
+valid = ~isnan(errors);
+fprintf('\n========== 定位性能评估 ==========\n');
+fprintf('✅ 定位覆盖率: %.2f%% (%d/%d)\n', ...
+    100*sum(located)/numBlindNodes, sum(located), numBlindNodes);
+fprintf('📏 平均定位误差: %.2f m\n', mean(errors(valid)));
+fprintf('📏 最大定位误差: %.2f m\n', max(errors(valid)));
+fprintf('📏 最小定位误差: %.2f m\n', min(errors(valid)));
+
+% 绘制定位误差分布
+figure;
+histogram(errors(valid), 20);
+xlabel('定位误差 (m)');
+ylabel('节点数量');
+title('盲节点定位误差分布');
+grid on;
+
+figure;
+plot(0:deltaT:simTime, roundAvgError(1:round));
+xlabel('时间 (s)');
+ylabel('平均定位误差 (m)');
+title('定位误差随时间收敛情况');
+grid on;
+
+%% ========== 辅助函数定义 ==========
+
+function [auxiliaryAnchors, blindNodes] = updatePositions(auxiliaryAnchors, blindNodes, ...
+    located, xBounds, yBounds, zBounds, deltaT)
+    % 更新所有节点位置（边界反射处理）
+    bounds = {xBounds, yBounds, zBounds};
+    
+    % 更新辅助锚点
+    for i = 1:length(auxiliaryAnchors)
+        auxiliaryAnchors(i) = moveNode(auxiliaryAnchors(i), bounds, deltaT);
+    end
+    
+    % 更新未定位的盲节点
+    for i = 1:length(blindNodes)
+        if ~located(i)
+            blindNodes(i) = moveNode(blindNodes(i), bounds, deltaT);
+        end
+    end
+end
+
+function node = moveNode(node, bounds, deltaT)
+    % 基于高斯-马尔可夫模型的节点移动
+    directionChangeProb = 0.05;  % 方向改变概率
+    
+    % 位置更新：p(t+Δt) = p(t) + v(t) * Δt
+    newPos = node.position + node.velocity * deltaT;
+    
+    % 边界检测与处理（弹性反射）
+    for dim = 1:3
+        if newPos(dim) < bounds{dim}(1) || newPos(dim) > bounds{dim}(2)
+            % 概率性改变方向
+            if rand() < directionChangeProb
+                newVelocity = randn(1,3);
+                newVelocity = newVelocity / norm(newVelocity) * norm(node.velocity);
+                node.velocity = newVelocity;
+            else
+                % 反射
+                node.velocity(dim) = -node.velocity(dim);
+            end
+            % 将位置钳制到边界内
+            newPos(dim) = min(max(newPos(dim), bounds{dim}(1)), bounds{dim}(2));
+        end
+    end
+    
+    node.position = newPos;
+end
