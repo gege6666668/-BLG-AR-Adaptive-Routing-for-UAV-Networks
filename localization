@@ -1,23 +1,40 @@
+
+---
+
+### run_simulation.m 
+%% BLG-AR Main Simulation Script
+% Runs complete simulation: localization + adaptive beaconing + game routing
+
 clc; clearvars; close all;
 
 %% ========== 参数设置 ==========
 % 网络参数
-numBlindNodes = 152;
-numAnchorNodes = 38;
+numBlindNodes = 160;
+numAnchorNodes = 40;
 communicationRange = 120;
 xBounds = [0, 500]; yBounds = [0, 500]; zBounds = [100, 400];
 
-% 定位算法参数（论文公式7-10）
-RSSI0 = -40; n = 3;          % RSSI模型参数
-noise_sigma = 1;             % 高斯白噪声标准差
-minAnchorThreshold = 3;      % 最小锚节点数量
-maxAcceptableError = 3.5;    % 最大可接受定位误差τ
-beta = 0.5; gamma = 0.5;     % 置信度衰减参数（公式9）
-eta = 0.1;                   % 动态误差修正学习率（公式5）
+% 定位算法参数（论文公式1-10）
+RSSI0 = -40; n = 3;
+noise_sigma = 1;
+minAnchorThreshold = 3;
+maxAcceptableError = 3.5;
+beta = 0.5; gamma = 0.5;
+eta = 0.1;
+
+% 路由协议参数
+sphericalAngle = 45;      % 球形筛选角度α
+alpha1 = 0.4; alpha2 = 0.35; alpha3 = 0.25;
+
+% 802.11ac协议参数
+packetSize = 1024;        % Bytes
+dataRate = 433e6;         % bps
+P_tx = 0.5; P_rx = 0.3;   % W
+T_pkt = packetSize*8 / dataRate;
 
 % 仿真参数
-deltaT = 0.5;                % 时间步长
-simTime = 200;               % 总仿真时间
+deltaT = 0.5;
+simTime = 200;
 
 % 5组源-目的节点对
 srcNodes = [1, 20, 35, 50, 75];
@@ -27,31 +44,26 @@ numPairs = length(srcNodes);
 %% ========== 初始化节点 ==========
 % 初始化锚节点
 anchorIDs = num2cell((numBlindNodes+1):(numBlindNodes+numAnchorNodes))';
-anchorPositions = [ ...
-    rand(numAnchorNodes,1)*diff(xBounds)+xBounds(1), ...
-    rand(numAnchorNodes,1)*diff(yBounds)+yBounds(1), ...
-    rand(numAnchorNodes,1)*diff(zBounds)+zBounds(1)];
-
-% 速度初始化
+anchorPositions = [rand(numAnchorNodes,1)*diff(xBounds)+xBounds(1), ...
+                   rand(numAnchorNodes,1)*diff(yBounds)+yBounds(1), ...
+                   rand(numAnchorNodes,1)*diff(zBounds)+zBounds(1)];
 anchorDirections = randn(numAnchorNodes,3);
 anchorDirections = anchorDirections ./ vecnorm(anchorDirections,2,2);
 anchorSpeeds = 70 + 30*rand(numAnchorNodes,1);
 anchorVelocities = anchorDirections .* anchorSpeeds;
 
-anchorNodes = struct(...
+auxiliaryAnchors = struct(...
     'id', anchorIDs, ...
     'position', num2cell(anchorPositions,2), ...
     'velocity', num2cell(anchorVelocities,2), ...
     'confidence', num2cell(ones(numAnchorNodes,1)), ...
-    'delta', num2cell(zeros(numAnchorNodes,1)));  % 动态误差修正因子Δ
+    'delta', num2cell(zeros(numAnchorNodes,1)));
 
 % 初始化盲节点
 blindIDs = num2cell(1:numBlindNodes)';
-blindPositions = [ ...
-    rand(numBlindNodes,1)*diff(xBounds)+xBounds(1), ...
-    rand(numBlindNodes,1)*diff(yBounds)+yBounds(1), ...
-    rand(numBlindNodes,1)*diff(zBounds)+zBounds(1)];
-
+blindPositions = [rand(numBlindNodes,1)*diff(xBounds)+xBounds(1), ...
+                  rand(numBlindNodes,1)*diff(yBounds)+yBounds(1), ...
+                  rand(numBlindNodes,1)*diff(zBounds)+zBounds(1)];
 blindDirections = randn(numBlindNodes,3);
 blindDirections = blindDirections ./ vecnorm(blindDirections,2,2);
 blindSpeeds = 70 + 30*rand(numBlindNodes,1);
@@ -62,210 +74,205 @@ blindNodes = struct(...
     'position', num2cell(blindPositions,2), ...
     'velocity', num2cell(blindVelocities,2));
 
-%% ========== 初始化定位变量 ==========
+%% ========== 初始化状态变量 ==========
 located = false(numBlindNodes,1);
 estimatedPositions = nan(numBlindNodes,3);
-errors = nan(numBlindNodes,1);
-auxiliaryAnchors = anchorNodes;  % 辅助锚点池（包含原始锚点+已定位盲节点）
+locErrors = nan(numBlindNodes,1);
 
-% 记录定位性能
-roundLocatedCount = zeros(simTime/deltaT, 1);
-roundAvgError = zeros(simTime/deltaT, 1);
+% 性能指标（论文公式21-28）
+packetsSent = zeros(1, numPairs);
+packetsReceived = zeros(1, numPairs);
+packetsForwarded = zeros(1, numPairs);
+packetsRelayed = zeros(1, numPairs);
+totalDelay = zeros(1, numPairs);
+
+% 能量统计
+totalTxPackets = 0;
+totalRxPackets = 0;
+
+packetID = 1;
+lastHelloTime = 0;
+helloInterval = 1.0;
 
 %% ========== 主仿真循环 ==========
+fprintf('========== BLG-AR Simulation Start ==========\n');
+
 for currentTime = 0:deltaT:simTime
     round = currentTime/deltaT + 1;
     
-    % ===== 1. 更新节点位置 =====
+    % 1. 更新节点位置
     [auxiliaryAnchors, blindNodes] = updatePositions(auxiliaryAnchors, blindNodes, ...
         located, xBounds, yBounds, zBounds, deltaT);
     
-    % ===== 2. 盲节点定位（论文公式1-10） =====
-    newlyLocated = 0;
-    currentRoundErrors = [];
+    % 2. 盲节点定位
+    [located, estimatedPositions, locErrors, auxiliaryAnchors] = ...
+        localization_main(blindNodes, auxiliaryAnchors, located, estimatedPositions, ...
+        locErrors, communicationRange, minAnchorThreshold, RSSI0, n, noise_sigma, ...
+        maxAcceptableError, beta, gamma, eta, xBounds, yBounds, zBounds);
     
-    for i = 1:numBlindNodes
-        if located(i); continue; end
-        
-        blindPos = blindNodes(i).position;
-        
-        % 获取通信范围内的所有锚节点（包括辅助锚点）
-        anchorPosAll = vertcat(auxiliaryAnchors.position);
-        dists = vecnorm(anchorPosAll - blindPos, 2, 2);
-        validMask = dists <= communicationRange;
-        
-        if sum(validMask) < minAnchorThreshold
-            continue;  % 锚点数量不足，跳过定位
-        end
-        
-        % 获取有效锚节点
-        validAnchors = auxiliaryAnchors(validMask);
-        validDists = dists(validMask);
-        
-        % === 2.1 RSSI测距（公式1） ===
-        % 修正：添加高斯白噪声
-        RSSI_measured = RSSI0 - 10*n*log10(validDists) + noise_sigma*randn(size(validDists));
-        d_estimated = 10.^((RSSI0 - RSSI_measured) / (10*n));  % 初始估计距离
-        
-        % === 2.2 动态误差修正（公式4-6） ===
-        deltas = [validAnchors.delta]';
-        d_corrected = d_estimated + deltas;  % 公式4：修正后的估计距离
-        
-        % === 2.3 构建定位方程组（公式2-3） ===
-        p = vertcat(validAnchors.position);
-        k = size(p, 1);
-        
-        % 以第一个锚点为参考，构建差分方程组
-        A = zeros(k-1, 3);
-        b = zeros(k-1, 1);
-        
-        for j = 2:k
-            A(j-1, :) = 2 * (p(1, :) - p(j, :));
-            b(j-1) = d_corrected(j)^2 - d_corrected(1)^2 + ...
-                      (p(1,1)^2 + p(1,2)^2 + p(1,3)^2) - ...
-                      (p(j,1)^2 + p(j,2)^2 + p(j,3)^2);
-        end
-        
-        % === 2.4 加权最小二乘求解（公式8-10） ===
-        % 获取置信度权重（公式8）
-        confidences = [validAnchors.confidence]';
-        W = diag(confidences(2:end));  % 权重矩阵（排除参考锚点）
-        
-        % 加权最小二乘解（公式10）
-        try
-            estimatedPos = (A' * W * A) \ (A' * W * b);
-        catch
-            % 若矩阵奇异，使用普通最小二乘
-            estimatedPos = (A' * A) \ (A' * b);
-        end
-        
-        % 计算定位误差
-        locError = norm(estimatedPos - blindPos);
-        
-        % === 2.5 判断是否满足升级条件（公式7） ===
-        if locError <= maxAcceptableError
-            located(i) = true;
-            estimatedPositions(i, :) = estimatedPos;
-            errors(i) = locError;
-            newlyLocated = newlyLocated + 1;
-            currentRoundErrors = [currentRoundErrors; locError];
+    % 3. 自适应Becaon间隔
+    if currentTime - lastHelloTime >= helloInterval
+        helloInterval = adaptive_beacon(auxiliaryAnchors, blindNodes, located, ...
+            estimatedPositions, helloInterval, deltaT);
+        lastHelloTime = currentTime;
+    end
+    
+    % 4. 生成数据包（每0.5秒）
+    if mod(currentTime, 0.5) == 0
+        for pairID = 1:numPairs
+            src = srcNodes(pairID);
+            dst = dstNodes(pairID);
             
-            % 计算该盲节点的置信度（公式8）
-            % 参数α由公式9确定：α = -ln(β) / (γ * τ)
-            alpha = -log(beta) / (gamma * maxAcceptableError);
-            nodeConfidence = exp(-alpha * locError);
-            
-            % === 2.6 动态更新锚节点的误差修正因子（公式5-6） ===
-            % 为使用过的锚节点更新delta值
-            for j = 1:length(validAnchors)
-                anchorIdx = find([auxiliaryAnchors.id] == validAnchors(j).id, 1);
-                if ~isempty(anchorIdx)
-                    trueDist = validDists(j);
-                    oldDelta = auxiliaryAnchors(anchorIdx).delta;
-                    % 公式6：Error = |trueDist - d_estimated|
-                    rangingError = abs(trueDist - d_estimated(j));
-                    % 公式5：Δ_new = (1-η)*Δ_old + η*Error
-                    auxiliaryAnchors(anchorIdx).delta = (1-eta) * oldDelta + eta * rangingError;
-                end
+            % 获取源节点位置
+            if src <= numBlindNodes
+                if ~located(src); continue; end
+                srcPos = estimatedPositions(src,:);
+            else
+                idx = find([auxiliaryAnchors.id] == src, 1);
+                if isempty(idx); continue; end
+                srcPos = auxiliaryAnchors(idx).position;
             end
             
-            % === 2.7 将满足条件的盲节点升级为辅助锚点 ===
-            % 生成随机速度
-            newDirection = randn(1,3);
-            newDirection = newDirection / norm(newDirection);
-            newSpeed = 70 + 30*rand();
-            newVelocity = newDirection * newSpeed;
+            % 获取目的节点位置
+            if dst <= numBlindNodes
+                if ~located(dst); continue; end
+                dstPos = estimatedPositions(dst,:);
+            else
+                idx = find([auxiliaryAnchors.id] == dst, 1);
+                if isempty(idx); continue; end
+                dstPos = auxiliaryAnchors(idx).position;
+            end
             
-            auxiliaryAnchors(end+1) = struct(...
-                'id', blindNodes(i).id, ...
-                'position', estimatedPos, ...
-                'velocity', newVelocity, ...
-                'confidence', nodeConfidence, ...
-                'delta', 0);
+            % 创建数据包
+            packet = struct(...
+                'id', packetID, 'pairID', pairID, 'src', src, 'dst', dst, ...
+                'srcPos', srcPos, 'dstPos', dstPos, 'generationTime', currentTime, ...
+                'lastHop', src, 'ttl', 30, 'path', [src], 'size', packetSize);
+            
+            % 加入缓冲区
+            if src <= numBlindNodes
+                if ~isfield(blindNodes, 'buffer'); [blindNodes.buffer] = deal([]); end
+                blindNodes(src).buffer = [blindNodes(src).buffer, packet];
+            else
+                idx = find([auxiliaryAnchors.id] == src, 1);
+                if ~isfield(auxiliaryAnchors, 'buffer'); [auxiliaryAnchors.buffer] = deal([]); end
+                auxiliaryAnchors(idx).buffer = [auxiliaryAnchors(idx).buffer, packet];
+            end
+            packetsSent(pairID) = packetsSent(pairID) + 1;
+            packetID = packetID + 1;
         end
     end
     
-    % 记录本轮定位性能
-    roundLocatedCount(round) = sum(located);
-    if ~isempty(currentRoundErrors)
-        roundAvgError(round) = mean(currentRoundErrors);
-    end
+    % 5. 数据包转发（调用game_routing模块）
+    [auxiliaryAnchors, blindNodes, packetsReceived, totalDelay, ...
+     packetsForwarded, packetsRelayed, totalTxPackets, totalRxPackets] = ...
+        game_routing(auxiliaryAnchors, blindNodes, located, estimatedPositions, ...
+        packetsReceived, totalDelay, packetsForwarded, packetsRelayed, ...
+        totalTxPackets, totalRxPackets, communicationRange, sphericalAngle, ...
+        alpha1, alpha2, alpha3, currentTime, numPairs);
     
-    % 每10轮输出一次进度
-    if mod(round, 20) == 0
-        fprintf('时间: %.1fs | 已定位: %d/%d (%.1f%%) | 平均误差: %.2fm\n', ...
-            currentTime, sum(located), numBlindNodes, ...
-            100*sum(located)/numBlindNodes, roundAvgError(round));
+    % 输出进度
+    if mod(round, 50) == 0
+        fprintf('Time: %.0fs | Located: %d/%d | Delivered: %d\n', ...
+            currentTime, sum(located), numBlindNodes, sum(packetsReceived));
     end
 end
 
-%% ========== 最终定位性能评估 ==========
-valid = ~isnan(errors);
-fprintf('\n========== 定位性能评估 ==========\n');
-fprintf('✅ 定位覆盖率: %.2f%% (%d/%d)\n', ...
-    100*sum(located)/numBlindNodes, sum(located), numBlindNodes);
-fprintf('📏 平均定位误差: %.2f m\n', mean(errors(valid)));
-fprintf('📏 最大定位误差: %.2f m\n', max(errors(valid)));
-fprintf('📏 最小定位误差: %.2f m\n', min(errors(valid)));
+%% ========== 性能评估==========
+fprintf('\n========== BLG-AR Performance Evaluation ==========\n');
 
-% 绘制定位误差分布
-figure;
-histogram(errors(valid), 20);
-xlabel('定位误差 (m)');
-ylabel('节点数量');
-title('盲节点定位误差分布');
-grid on;
+pairResults = zeros(numPairs, 5);  % [PDR, AvDelay, Throughput, RO, ~]
 
-figure;
-plot(0:deltaT:simTime, roundAvgError(1:round));
-xlabel('时间 (s)');
-ylabel('平均定位误差 (m)');
-title('定位误差随时间收敛情况');
-grid on;
-
-%% ========== 辅助函数定义 ==========
-
-function [auxiliaryAnchors, blindNodes] = updatePositions(auxiliaryAnchors, blindNodes, ...
-    located, xBounds, yBounds, zBounds, deltaT)
-    % 更新所有节点位置（边界反射处理）
-    bounds = {xBounds, yBounds, zBounds};
+for pairID = 1:numPairs
+    % Packet Delivery Ratio
+    PDR = packetsReceived(pairID) / max(1, packetsSent(pairID));
     
-    % 更新辅助锚点
-    for i = 1:length(auxiliaryAnchors)
-        auxiliaryAnchors(i) = moveNode(auxiliaryAnchors(i), bounds, deltaT);
+    % Average End-to-End Delay
+    if packetsReceived(pairID) > 0
+        AvDelay = totalDelay(pairID) / packetsReceived(pairID);
+    else
+        AvDelay = 0;
     end
     
-    % 更新未定位的盲节点
-    for i = 1:length(blindNodes)
+    %Throughput (Kbps)
+    totalBytes = packetsReceived(pairID) * packetSize;
+    Throughput = (totalBytes * 8) / simTime / 1000;
+    
+    %Routing Overhead
+    N_S = max(1, packetsReceived(pairID));
+    RO = (packetsForwarded(pairID) + packetsRelayed(pairID)) / N_S;
+    
+    pairResults(pairID, :) = [PDR, AvDelay, Throughput, RO, 0];
+    
+    fprintf('Pair %d (Node%d→%d): PDR=%.1f%%, Delay=%.3fs, Throughput=%.2fKbps, RO=%.2f\n', ...
+        pairID, srcNodes(pairID), dstNodes(pairID), PDR*100, AvDelay, Throughput, RO);
+end
+
+% 平均性能
+fprintf('\n========== Average Performance (5 Pairs) ==========\n');
+fprintf('Avg PDR: %.2f%% (Eq.21)\n', mean(pairResults(:,1))*100);
+fprintf('Avg Delay: %.4f s (Eq.22)\n', mean(pairResults(:,2)));
+fprintf('Avg Throughput: %.2f Kbps (Eq.23)\n', mean(pairResults(:,3)));
+fprintf('Avg Routing Overhead: %.2f (Eq.24)\n', mean(pairResults(:,4)));
+
+% 能量消耗
+E_tx = totalTxPackets * P_tx * T_pkt;   % 公式26
+E_rx = totalRxPackets * P_rx * T_pkt;   % 公式27
+E_total = E_tx + E_rx;                   % 公式25
+
+fprintf('\n========== Energy Consumption (Eq.25-28) ==========\n');
+fprintf('Total Tx Packets N_tx: %d\n', totalTxPackets);
+fprintf('Total Rx Packets N_rx: %d\n', totalRxPackets);
+fprintf('Packet Transmission Time T_pkt: %.6f s (Eq.28)\n', T_pkt);
+fprintf('Tx Energy E_tx: %.2f J (Eq.26)\n', E_tx);
+fprintf('Rx Energy E_rx: %.2f J (Eq.27)\n', E_rx);
+fprintf('Total Energy E_total: %.2f J (Eq.25)\n', E_total);
+
+% 绘图
+figDir = 'results/figures';
+if ~exist(figDir, 'dir'); mkdir(figDir); end
+
+figure('Position', [100,100,1200,400]);
+subplot(1,3,1);
+valid = ~isnan(locErrors);
+histogram(locErrors(valid), 20);
+xlabel('Localization Error (m)'); ylabel('Node Count');
+title('Blind Node Localization Error');
+
+subplot(1,3,2);
+bar(1:numPairs, pairResults(:,1)*100);
+xlabel('Communication Pair'); ylabel('PDR (%)');
+title('Packet Delivery Ratio (Eq.21)'); ylim([0 100]); grid on;
+
+subplot(1,3,3);
+bar(1:numPairs, pairResults(:,2));
+xlabel('Communication Pair'); ylabel('Delay (s)');
+title('End-to-End Delay (Eq.22)'); grid on;
+
+saveas(gcf, fullfile(figDir, 'BLGAR_results.png'));
+fprintf('\nFigures saved to: %s\n', fullfile(figDir, 'BLGAR_results.png'));
+fprintf('\n========== BLG-AR Simulation Complete ==========\n');
+
+%% ========== 辅助函数 ==========
+function [aux, blind] = updatePositions(aux, blind, located, xB, yB, zB, dt)
+    bounds = {xB, yB, zB};
+    for i = 1:length(aux)
+        aux(i) = moveNode(aux(i), bounds, dt);
+    end
+    for i = 1:length(blind)
         if ~located(i)
-            blindNodes(i) = moveNode(blindNodes(i), bounds, deltaT);
+            blind(i) = moveNode(blind(i), bounds, dt);
         end
     end
 end
 
-function node = moveNode(node, bounds, deltaT)
-    % 基于高斯-马尔可夫模型的节点移动
-    directionChangeProb = 0.05;  % 方向改变概率
-    
-    % 位置更新：p(t+Δt) = p(t) + v(t) * Δt
-    newPos = node.position + node.velocity * deltaT;
-    
-    % 边界检测与处理（弹性反射）
+function node = moveNode(node, bounds, dt)
+    newPos = node.position + node.velocity * dt;
     for dim = 1:3
         if newPos(dim) < bounds{dim}(1) || newPos(dim) > bounds{dim}(2)
-            % 概率性改变方向
-            if rand() < directionChangeProb
-                newVelocity = randn(1,3);
-                newVelocity = newVelocity / norm(newVelocity) * norm(node.velocity);
-                node.velocity = newVelocity;
-            else
-                % 反射
-                node.velocity(dim) = -node.velocity(dim);
-            end
-            % 将位置钳制到边界内
+            node.velocity(dim) = -node.velocity(dim);
             newPos(dim) = min(max(newPos(dim), bounds{dim}(1)), bounds{dim}(2));
         end
     end
-    
     node.position = newPos;
 end
