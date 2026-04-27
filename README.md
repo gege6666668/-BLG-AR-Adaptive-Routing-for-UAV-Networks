@@ -1,4 +1,4 @@
-# BLG-AR: Adaptive Routing for UAV Networks
+# BLG-AR
 
 This repository provides a simplified MATLAB implementation of the BLG-AR method.
 
