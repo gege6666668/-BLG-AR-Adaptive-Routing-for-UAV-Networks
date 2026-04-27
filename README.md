@@ -1,12 +1,17 @@
 # BLG-AR: Adaptive Routing for UAV Networks
 
-This repository contains the MATLAB implementation of the BLG-AR algorithm proposed in our paper:
-"Adaptive Routing for UAV Networks Based on Blind Node Localization and Game-Theoretic Path Selection"
+This repository provides a simplified MATLAB implementation of the BLG-AR method.
 
  Requirements
 - MATLAB R2023a or later
 
-Quick Start
-Run the main simulation script:
-matlab
-run_simulation
+ Structure
+- localization/: blind node localization module
+- adaptive_beacon.m: adaptive beacon interval adjustment
+- game_routing.m: game-theoretic routing strategy
+- run_simulation.m: main entry for simulation
+
+ How to Run
+Run the following script in MATLAB:
+
+run_simulation.m
