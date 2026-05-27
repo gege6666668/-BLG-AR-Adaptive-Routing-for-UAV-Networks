@@ -38,6 +38,7 @@ The datasets were generated through MATLAB-based simulations under different net
 
 The CSV files correspond to the numerical results used to generate the figures and performance evaluations reported in the manuscript.
 
+The datasets are provided in CSV format under the datasets/ directory. Each file corresponds to one performance metric reported in the manuscript.
 ## How to Run
 
 Run the following script in MATLAB:
